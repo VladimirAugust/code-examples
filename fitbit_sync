@@ -1,0 +1,293 @@
+import datetime
+import datetime as dt
+import json
+import os
+import platform
+import threading
+import traceback
+from multiprocessing.dummy import Pool
+
+import pandas as pd
+import pytz
+from dateutil import parser
+from fitbit import Fitbit
+from loguru import logger
+
+from .device import Device
+from ohnapi import config
+from ohnapi.model import exceptions
+from ohnapi.util import cache_utils
+from ohnapi.util import calendar_utils
+from ohnapi.util import telegram
+from ohnapi.util import pytools
+
+
+class FitBitDevice(Device):
+    _fitbit_client = None
+    DEVICE_MANUFACTURER = 'fitbit_sync'
+
+    resources = [
+        'activities/heart',
+        'activities/steps',
+        'activities/calories',
+        'activities/minutesSedentary',
+        'activities/minutesLightlyActive',
+        'activities/minutesFairlyActive',
+        'activities/minutesVeryActive',
+        'activities/activityCalories',
+    ]
+    period = ('3m', 90)  # both values are used in different FitBit APIs and should be equal. The second is the number of days, which should be equal to the first
+
+    @telegram.log_errors()
+    def sync(self, *args, **kwargs):
+        assert 'user' in kwargs, "user should be given as a parameter for the sync method"
+        user = kwargs['user']
+
+        sync_thread = threading.Thread(
+            target=self._sync_background_process,
+            daemon=True,
+            name=f'FitBit background sync for {self.username}',
+            kwargs={'user': user}
+        )
+        sync_thread.start()
+
+    @pytools.retry_function(
+        retries=3,
+        delay=60,
+        error_log_text='FitBit synchronization failed',
+        abandon_exceptions=cache_utils.BLOCKED_BY_CACHE_LOCK_ERROR,
+    )
+    @telegram.log_errors(ignore_exceptions=cache_utils.BLOCKED_BY_CACHE_LOCK_ERROR)
+    def _sync_background_process(self, user):
+        with cache_utils.cache_lock(f"FitBit_sync_{user.username}", lock_expire=600):
+            log_prefix = f"in FitBitDevice/sync_background_process (process {os. getpid()}, thread {threading.get_ident()}, {user}, {self})"
+
+            logger.info(f"{log_prefix} background sync starting...")
+
+            # Clearing all calendar data
+            date_from = dt.datetime.now() - dt.timedelta(days=self.period[1])
+            if self.last_sync_ts and self.last_sync_ts > date_from:
+                date_from = self.last_sync_ts
+            date_from = date_from.replace(hour=0, minute=0, second=0, microsecond=0)  # it is also necessary to update the whole day date_from
+            calendar_utils.clear_calendar(user.username, date_from, dt.datetime.now() + dt.timedelta(days=1))
+
+            success_statistics, success_activities = False, False
+            with Pool(10) as thread_pool:
+                try:  # Getting general daily statistics
+                    statistics = self._get_statistics(user, log_prefix)
+                    if statistics is None or statistics.empty:
+                        logger.info(
+                            f"{log_prefix} no statistics to add to the calendar, "
+                            f"no new information has been received since the last synchronization"
+                        )
+                    else:
+                        logger.info(f"{log_prefix} adding the statistics to the calendar...")
+                        workers_data = self._prepare_stats_for_adding_to_calendar(statistics, log_prefix, user)
+                        thread_pool.map(self._add_statistics_to_calendar, workers_data)
+                        logger.info(f"{log_prefix} finished adding the statistics")
+                    success_statistics = True
+                except:
+                    logger.exception(f"{log_prefix} Couldn't add user statistics")
+
+                if success_statistics:
+                    try:  # Getting activities
+                        activities = self._get_user_activities(date_from, log_prefix=log_prefix)
+                        if not activities:
+                            logger.info(
+                                f"{log_prefix} no activities to add to the calendar, "
+                                f"no new information has been received since the last synchronization"
+                            )
+                        else:
+                            logger.info(f"{log_prefix} adding the activities to the calendar...")
+                            workers_data = [(a, log_prefix, user) for a in activities]
+                            thread_pool.map(self._add_activities_to_calendar, workers_data)
+                            logger.info(f"{log_prefix} finished adding the activities")
+                        success_activities = True
+                    except:
+                        logger.exception(f"{log_prefix} Couldn't add user activities")
+
+            if success_statistics and success_activities:
+                self.last_sync_ts = dt.datetime.now()
+                self.save()
+                logger.info(f"{log_prefix} sync finished successfully")
+            else:
+                raise exceptions.FitBitSyncException(
+                    f"Couldn't finish successfully fitbit sync. "
+                    f"success_statistics = {success_statistics}, success_activities = {success_activities}"
+                )
+
+    @property
+    def fitbit_client(self):
+        if self._fitbit_client is None:
+            fitbit_args = {
+                'client_id': config.fitbit_client_id,
+                'client_secret': config.fitbit_client_secret,
+                'oauth2': True,
+                'access_token': self.oauth2_access_token,
+                'refresh_token': self.oauth2_refresh_token,
+                'expires_at': float(self.oauth2_token_expires_at),
+                'redirect_uri': config.fitbit_redirect_uri,
+                'refresh_cb': self._refresh_token
+            }
+            self._fitbit_client = Fitbit(**fitbit_args)
+
+        return self._fitbit_client
+
+    @pytools.retry_function(retries=3, error_log_text='could not get FitBit general statistics data')
+    def _get_statistics(self, user, log_prefix):
+        activities = []
+        logger.info(f"{log_prefix} downloading statistics")
+        for resource in self.resources:
+            logger.info(f"{log_prefix} downloading {resource}")
+            try:
+                activity_json = self.fitbit_client.time_series(resource=resource, period=self.period[0])
+                activities.append(activity_json)
+            except Exception as e:
+                logger.info(f"{log_prefix} can't download {resource}, reason: {e}") # TODO: fully exit?
+        if not activities:
+            raise Exception(f"{log_prefix} there are no statistics from any resource")
+
+        logger.info(f"{log_prefix} constructing DataFrame")
+        df_list = []
+        for activity in activities:
+            df = pd.DataFrame()
+            column_name = [f for f in activity][0]
+            if column_name == 'activities-heart':
+                records = []
+                for row in activity[column_name]:
+                    act = {'dateTime': row['dateTime']}
+                    act.update({'HR_zone_min_' + str(z['min']) + '_max_' + str(z['max']): z.get('minutes', 0) for z in
+                                row['value']['heartRateZones']})
+                    records.append(act)
+                df = df.from_records(records, index='dateTime')
+            else:
+                df = df.from_records(activity[column_name], index='dateTime')
+                df.rename(columns={'value': column_name}, inplace=True)
+            df_list.append(df)
+
+        if len(df_list) == 0: return  ### if no data, quit quietly and gracefully
+
+        final_df = pd.concat(df_list, axis=1)
+        final_df.index.rename('time', inplace=True)
+        final_df.index = pd.to_datetime(final_df.index)
+
+        ### write out tmp dataframe
+        try:
+            file = "/tmp/chopdata/" + "fitbit_" + user.username + "_" + dt.datetime.now().isoformat() + ".csv"
+            if platform.system() == "Windows":
+                file = file.replace(':', '-').replace('@', '-at-')
+            final_df.to_csv(file)
+        except Exception as e:
+            logger.error(f"{log_prefix} exception in saving: {e}")
+
+        # cutting off data that has already been synchronized
+        if self.last_sync_ts:
+            final_df = final_df[final_df.index >= pd.to_datetime(self.last_sync_ts)]
+        return final_df
+
+
+    def _prepare_stats_for_adding_to_calendar(self, final_df, log_prefix, user):
+        final_df.index = final_df.index.map(lambda x: x + datetime.timedelta(hours=12))
+        workers_data = []
+        for i in range(len(final_df)):
+            row = final_df.iloc[[i]]
+            row_date = str(row.index[0])
+            workers_data.append((user, row, row_date, log_prefix, self._transform_data_to_report(row)))
+        return workers_data
+
+    def _refresh_token(self, token_dict):
+        self.oauth_access_token = token_dict['access_token']
+        self.oauth2_refresh_token = token_dict['refresh_token']
+        self.oauth2_token_expires_at = str(token_dict['expires_at'])
+        self.save()
+
+    def _transform_data_to_report(self, data):
+        df = pd.DataFrame(data)
+        df.index = ['value']
+        df = df.transpose().reset_index().rename({'index':'element_slug'}, axis = 1)
+        df['alt_value'] = df['value']
+        df['choice_slugs'] = None
+        return df
+
+    def _add_statistics_to_calendar(self, data):
+        user, row, date, log_prefix, report_row = data
+
+        calendar_utils.add_dataframe_to_calendar(
+            user=user.username,
+            inner_element_data=row,
+            time_series_field_element_slug='fitbit_statistics',
+            title='FitBit: statistics for the day',
+            date=date,
+            logging_prefix=log_prefix,
+            report_element_data=report_row
+        )
+
+    def _add_activities_to_calendar(self, data):
+        activity, log_prefix, user = data
+        report_row = self._transform_data_to_report(activity)
+
+        calendar_utils.add_dataframe_to_calendar(
+            user=user.username,
+            inner_element_data=activity,
+            time_series_field_element_slug='fitbit_activities',
+            title='FitBit: ' + activity['activityName'][0],
+            date=pd.to_datetime(activity.index[0]),
+            logging_prefix=log_prefix,
+            report_element_data=report_row
+        )
+
+
+    @pytools.retry_function(retries=3, error_log_text='could not get activity data')
+    def _get_user_activities(self, date_from, log_prefix=''):
+        url = f'https://api.fitbit.com/1/user/-/activities/list.json?afterDate={date_from.strftime("%Y-%m-%d")}&sort=asc&offset=0&limit=100'
+        activities = []
+        logger.info(f"{log_prefix} Getting user activities...")
+        while True:
+            if not url:
+                break
+            try:
+                result = self.fitbit_client.make_request(url=url)
+                url = result['pagination']['next']
+            except (AttributeError, KeyError):
+                url = None
+
+            for val in result['activities']:
+                try:
+                    if type(val['startTime']) is not dt.datetime:
+                        val['startTime'] = parser.parse(val['startTime']).astimezone(pytz.UTC)
+                    dataframe = pd.json_normalize(val).rename(columns={'startTime': 'datetime'}).set_index('datetime')
+                    activities.append(self._adapt_for_frontend(dataframe, log_prefix))
+                except:
+                    logger.warning(f"{log_prefix}: couldn't transform to a DataFrame value: {str(val)}\n{traceback.format_exc()}")
+
+        return activities
+
+    def _adapt_for_frontend(self, dataframe, log_prefix):
+        i = 0
+        for column_name in dataframe:
+            column = dataframe[column_name][0]
+            if column_name == 'activeDuration':
+                dataframe[column_name] = dataframe[column_name].apply(lambda x: calendar_utils.format_millis_to_hms(x))
+            if type(column) is list:
+                if not column or type(column[0]) is not dict:  # an empty list or a list of strings
+                    i += 1
+                    continue
+                if 'zoneName' in column[0]:  # unnecessary empty data
+                    dataframe = dataframe.drop(dataframe.columns[i], axis=1)
+                    continue
+                dataframe = dataframe.drop(dataframe.columns[i], axis=1)
+                if 'order' in column[0]:
+                    column = sorted(column, key=lambda x: x['order'])
+                for elem in column:
+                    name = f"{column_name.split('.')[-1]}: {elem.get('zoneName') or elem.get('name')}"
+                    if 'name' in elem:
+                        del elem['name']
+                    else:
+                        logger.warning(f"{log_prefix}: unhandled type of FitBit activity element: {data}")
+                    data = json.dumps(elem).replace('"', '').replace('{', '').replace('}', '')
+
+                    dataframe.insert(i, name, data)
+                    i += 1
+            else:
+                i += 1
+        return dataframe
