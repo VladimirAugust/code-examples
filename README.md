@@ -1,5 +1,8 @@
 Examples of program code that I wrote:
 
+fitbit_sync.py:
+This is a part I created for a project related to downloading data from FitBit devices.
+
 ThreadWorker.py:
 This is a part of big program - comporator for prices from various international telecom operators)
 Thread Worker loads excel files with data (from telecom operators) and build a comparison table for different operators
