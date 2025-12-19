@@ -1,5 +1,8 @@
 Examples of program code that I wrote:
 
+strategy_implementations.py:
+This code implements a strategy-based data processing pipeline that reads input (from S3 files or table rows), sends it to an LLM for extraction, validates the JSON output, and stores the structured result in MongoDB. It uses a template method pattern with retryable and non-retryable error handling, plus detailed status reporting for both parent uploads and child entities. 
+
 fitbit_sync.py:
 This is a part I created for a project related to downloading data from FitBit devices.
 
